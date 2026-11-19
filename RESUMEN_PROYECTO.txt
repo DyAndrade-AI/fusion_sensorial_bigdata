@@ -1,0 +1,128 @@
+FUSIÓN SENSORIAL + ÍNDICE DE VALOR (PySpark) - RESUMEN DEL PROYECTO
+=====================================================================
+
+1. QUÉ ESTAMOS HACIENDO
+Un sistema de recomendación turística que NO pregunta al usuario qué destino quiere.
+Interpreta preferencias sensoriales (música y color), las convierte en un perfil numérico
+y lo compara con el perfil turístico de cada destino, calculado a partir de 208,051
+reseñas reales del dataset Rest-Mex 2025. Un parámetro de "presupuesto" añade un factor
+de valor/precio percibido (Índice de Valor), que permite detectar "joyas ocultas".
+
+2. DATOS REALES (verificados sobre el archivo)
+- 208,051 reseñas; columnas: Title, Review, Polarity (1-5), Town, Region, Type.
+- Type: Restaurant 86,720 | Attractive 69,921 | Hotel 51,410.
+- 40 destinos (Town), 19 regiones. Polarity muy sesgada: 65.6% son 5 estrellas.
+- El dataset NO trae nombre de establecimiento: la unidad de recomendación es (Town, Type),
+  p. ej. "Restaurantes en Tulum". Con mínimo de 150 reseñas quedan 108 unidades.
+- El texto no estaba normalizado de forma uniforme (30.5% con acentos): se quitan acentos
+  antes de buscar palabras.
+
+3. DECISIÓN SOBRE SPOTIFY (investigada, no supuesta)
+- Audio Features (BPM, energy, danceability, valence) y otros endpoints se cerraron para
+  apps nuevas el 27-nov-2024. En febrero de 2026 hubo más restricciones (playlists:
+  "tracks" pasó a "items", y el contenido puede no entregarse en playlists ajenas).
+  Prueba propia: la API devolvió nombre y descripción de la playlist, pero ni "items" ni "tracks".
+- La Developer Policy (mayo 2025) prohíbe usar contenido de Spotify para perfilar usuarios
+  y para entrenar/ingerir en modelos de ML/IA.
+- Apple Music: la API exige pertenecer al Apple Developer Program y su catálogo no expone
+  tempo/energy/valence. YouTube Music: sin API oficial de características de audio.
+- Conclusión: no se usa ninguna API de streaming. La música entra por:
+  (a) PRESETS por género/ambiente (data/presets.json, valores típicos aproximados y editables),
+  (b) parámetros manuales (BPM, energy, danceability, valence), o
+  (c) CSV con esas columnas obtenido de una fuente independiente y autorizada.
+- Letras de canciones: se evaluó y se DESCARTÓ para esta versión (ver sección 9).
+
+4. ARQUITECTURA
+  Entrada sensorial        Big Data (PySpark, offline)           Recomendación (Python)
+  música (a/b/c) + color -> reseñas -> texto normalizado ->  ->  perfil -> intención τ ->
+  (hex o imagen)            banderas por dimensión ->            afinidad coseno ->
+                            agregación (Town,Type) ->            score con calidad/valor ->
+                            percentiles + TF-IDF ->              top-N + explicación
+                            profiles.json (108 filas)
+- Parte Big Data: todo lo de build_profiles.py (Spark DataFrames, Window, joins, agregaciones,
+  TF-IDF distribuido) y la fiabilidad por mitades.
+- Parte recomendación: sensory.py, recommender.py, main.py, evaluate.py (Python puro sobre
+  la tabla pequeña de perfiles).
+- Honestidad técnica: el dataset (61 MB) cabe en memoria de una laptop. Spark se justifica
+  por el procesamiento de texto a escala, por el diseño escalable (el mismo código corre
+  en un clúster) y por el modelo de programación, no porque sea inmanejable.
+
+5. PROCESAMIENTO CON PYSPARK (src/build_profiles.py)
+1) Lectura del CSV con esquema explícito. 2) Normalización: minúsculas, sin acentos, solo letras.
+3) Una bandera 0/1 por dimensión: ¿la reseña menciona alguna palabra del léxico?
+   Dimensiones turísticas: vida nocturna, aventura, naturaleza, descanso, cultura, gastronomía,
+   playa. Dimensiones de precio: valor_barato, valor_caro. (Todas con cobertura >4% medida
+   en el corpus; el léxico es una hipótesis validada contra los datos.)
+4) Agregación por (Town, Region, Type): n, polaridad media, tasa de mención por dimensión.
+5) Calidad suavizada (bayesiana): q = (n*media + m*mu)/(n+m), m=200, mu=media global.
+6) Índice de Valor: V = log((barato + a)/(caro + a)), a=0.01 (evita log(0) y división por 0).
+7) Percentiles (Window): uno DENTRO de cada Type y otro GLOBAL; el perfil turístico mezcla
+   ambos: t = 0.5*percentil_tipo + 0.5*percentil_global, centrado en [-1,1].
+   El del tipo evita el sesgo (un restaurante siempre habla más de comida); el global
+   conserva la magnitud real entre tipos.
+8) "Joya oculta": valor >= 0.6, calidad >= 0.5 y popularidad (nº de reseñas) <= 0.5 en su Type.
+9) TF-IDF por destino (cada Town es un documento, idf = log((N+1)/(df+1))): términos distintivos
+   que se muestran como evidencia en las explicaciones.
+Técnicas descartadas por no aportar valor: LDA, Word2Vec, sentimiento propio (ya existe Polarity).
+
+6. MÓDULO SENSORIAL Y MATEMÁTICA (src/sensory.py, src/recommender.py)
+Ejes en [0,1]: A = activación, P = positividad, W = calidez.
+- Música: bpm_n = clip((BPM-60)/120, 0, 1); A_m = 0.35*bpm_n + 0.35*energy + 0.30*danceability;
+  P_m = valence.
+- Color: RGB -> HSV. Calidez W_c = (1 + cos(hue - 30°))/2 (máx. naranja, mín. azul), atenuada
+  hacia 0.5 en colores poco saturados. A_c = 0.5*S + 0.3*W_c + 0.2*V; P_c = 0.5*V + 0.5*W_c.
+  Imagen: paleta de 5 colores dominantes; se promedian los EJES ponderados por proporción.
+- Fusión tardía: A y P = 0.5*música + 0.5*color; W solo viene del color (0.5 si no hay color).
+- Intención turística: τ = M · (a, p, w) con ejes centrados a=2A-1, etc. M es una matriz
+  explícita 7x3 (hipótesis heurística, ver limitaciones).
+- Afinidad = (coseno(τ, t) + 1)/2.
+- Calidad-valor = (1 - presupuesto)*q_norm + presupuesto*v_norm.
+- Score final = 100 * afinidad^0.7 * calidad_valor^0.3.
+- Explicación: dimensiones donde el usuario busca (τ>0) y el destino está sobre el promedio
+  (t>0), tasas de menciones de precio, polaridad, joya oculta y términos TF-IDF.
+
+7. EVALUACIÓN (no hay ground truth, se miden coherencia y estabilidad)
+- Coherencia: un perfil rápido/cálido debe subir vida nocturna y aventura; uno lento/frío,
+  descanso y naturaleza.
+- Presupuesto: al subir de 0 a 1 el valor medio del top-10 debe aumentar.
+- Cobertura: con 200 perfiles sensoriales aleatorios, qué fracción del catálogo llega a algún
+  top-10 y cómo se reparte por Type.
+- Fiabilidad por mitades (Spark): Spearman entre perfiles calculados con dos mitades aleatorias
+  de las reseñas. Resultado real obtenido: vida nocturna 0.894, aventura 0.935,
+  naturaleza 0.977, descanso 0.922, cultura 0.969, gastronomía 0.979, playa 0.835.
+- Tabla de top-2 por preset de género (python -m src.evaluate --presets).
+- Primera versión: PASS en los tres chequeos de coherencia. Hallazgo: la normalización solo
+  dentro del Type hacía que los restaurantes dominaran; se corrigió con la mezcla de percentiles.
+  (Completar aquí con la salida final de evaluate tras la ejecución definitiva.)
+
+8. CÓMO EJECUTARLO
+Requisitos: Python 3.10+, Java 17+, pip install pyspark Pillow.
+  cp Rest-Mex_2025_train_clean.csv data/raw/
+  python -m src.build_profiles          # Spark: genera data/processed/profiles.json
+  python -m src.evaluate --presets --split-half
+  python -m src.main --preset reggaeton --color "#FF8800" --presupuesto 0.5
+  python -m src.main --color "#6FA8DC" --presupuesto 0.8 --solo-joyas --vista destinos
+  python -m src.main --listar-presets
+Ejecutar siempre desde la raíz del proyecto. Se ejecutó con éxito en Google Colab
+(208,051 reseñas, 108 unidades).
+
+9. LIMITACIONES (declararlas en la presentación)
+- La unidad es (Town, Type), no un establecimiento individual.
+- La matriz M, los pesos música/color y los valores de los presets son HEURÍSTICOS
+  (asociaciones cross-modales), no estimados con datos.
+- El valor percibido se calcula solo con ~10% de reseñas que mencionan precio: es ruidoso
+  en destinos con pocas menciones.
+- El léxico es en español; hay algunas reseñas en inglés y nombres propios que se cuelan
+  en los términos TF-IDF.
+- La cobertura del catálogo con perfiles aleatorios no es total (algunas unidades casi
+  nunca quedan en el top-10).
+- Las letras se descartaron: aportan emoción (eje P) pero casi nada de ritmo/energía, requieren
+  un léxico o modelo de sentimiento en español sin validar, y añaden complejidad sin
+  justificación sólida. Queda como trabajo futuro.
+
+10. MEJORAS FUTURAS
+- Letras -> eje P con un modelo de sentimiento/emoción en español validado.
+- Calibrar M y los pesos con datos de preferencias reales (encuesta a usuarios).
+- Embeddings de reseñas por fragmentos (no truncados) para complementar el léxico.
+- Fuente de características musicales independiente y autorizada para canciones concretas.
+- Sustituir el léxico por clasificación de aspectos entrenada.
